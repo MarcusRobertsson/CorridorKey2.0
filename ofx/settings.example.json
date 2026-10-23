@@ -1,0 +1,19 @@
+{
+  "auto_vram": true,
+  "carry_hint": true,
+  "carry_hint_quality": 0.95,
+  "hann_chunk": 8,
+  "hann_stride": 4,
+  "low_vram": true,
+  "model_scale": 1.0,
+  "stage2_batch": 1,
+  "low_vram_foundation_chunk": 4,
+  "low_vram_enc_frame_chunk": 1,
+  "low_vram_mlp_chunk_tokens": 65536,
+  "low_vram_swin_window_batch": 16,
+  "low_vram_full_attn_query_chunk_tokens": 2048,
+  "linear_brightness": 1.0,
+  "linear_contrast": 1.0,
+  "linear_contrast_pivot": 0.18,
+  "seed": 0
+}

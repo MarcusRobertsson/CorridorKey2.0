@@ -1,5 +1,17 @@
 # Third-Party Notices
 
+## Community OFX integration
+
+`ofx/` contains a community Windows OpenFX integration for DaVinci Resolve.
+Its vendored OpenFX headers and support library were obtained from
+`gitcapoom/corridorkey_ofx` at commit
+`ef2bdd0c619a34cead9929d49541eb753d3d2df0`. OpenFX is BSD-3-Clause;
+see `ofx/plugin/openfx/LICENSE.md`. The v1 reference project's CC BY-NC-SA 4.0
+notice is preserved in `ofx/V1-LICENSE.txt`. Optional BiRefNet models and
+their custom inference code are published by Peng Zheng and contributors
+under MIT; they are downloaded separately from the publisher and are not
+bundled. The v2 model and foundation-model notices below still apply.
+
 CorridorKey v2 is licensed under the Corridor Key Licence (see `LICENSE`).
 It depends on the third-party components below, which are not owned by
 Corridor Digital LLC and remain under their own licenses.

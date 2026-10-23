@@ -37,3 +37,11 @@ tmp/
 # Local / studio-specific files
 path_mappings.json
 .claude/
+
+# Local OFX development and runtime
+.reference-ofx/
+.tools/
+.venv-ofx/
+ofx/build*/
+ofx/dist/
+.zig-cache/
