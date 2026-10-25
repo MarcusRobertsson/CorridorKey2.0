@@ -161,6 +161,22 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(self.send(r))
         self.assertIn("OFX owns", (self.work / "error.txt").read_text())
 
+    def test_staged_snapshot_skips_repeat_hash_but_new_job_reads_sources(self):
+        r = request(); r['staged_token'] = 'job-1'
+        self.assertTrue(self.send(r))
+        p = self.work / 'predictions/fg_000000.npy'
+        stamp = p.stat().st_mtime_ns
+        # This snapshot is immutable while the job runs; native code cancels the
+        # job on edits. A new token must read changed bytes, never reuse the old job.
+        self.frames[0][..., 0] = 7
+        self.frames[0].tofile(self.work / 'source_000000.bin')
+        r['index'] = 1
+        self.assertTrue(self.send(r))
+        self.assertEqual(p.stat().st_mtime_ns, stamp)
+        r['staged_token'] = 'job-2'
+        self.assertTrue(self.send(r))
+        np.testing.assert_allclose(np.load(p)[..., 0], 7)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,3 +45,4 @@ path_mappings.json
 ofx/build*/
 ofx/dist/
 .zig-cache/
+.cache-ofx/

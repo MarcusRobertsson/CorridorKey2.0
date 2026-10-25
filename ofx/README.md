@@ -42,6 +42,43 @@ The bundle includes backend source, but is not a self-contained Python distribut
 
 ## Resolve workflow
 
+### Process once, then play back
+
+1. Set up the key and choose your output view.
+2. Click **Process Entire Clip** in the node Inspector. Processing runs through
+   the open Fusion composition in the background; keep Resolve and that comp open.
+3. **Processing Status** displays the completed-frame count and percentage.
+   **DONE — N / N frames cached. Ready for playback.** means every output frame
+   in the clip's composition range has been committed to disk.
+4. Play the clip. Full-resolution cached frames bypass the AI and source-frame
+   gathering. The first playback may still fill Fusion's RAM cache; performance
+   also depends on SSD speed and downstream nodes.
+
+**Cancel Processing** stops after the current frame finishes; it never marks a
+partial job as done. Changing key settings or reconnecting inputs cancels and
+invalidates the old bake. Click Process Entire Clip again after edits. Changes
+to source files on disk or edits upstream that Fusion does not notify as input
+changes require manually processing again. Do not edit upstream footage during
+a job: it uses frozen per-block inputs.
+
+This feature uses Resolve's local Fusion scripting API. If startup fails, click
+**Refresh Status** to read its error. External scripting must allow **Local** in
+Resolve Preferences > System > General. There is no network service involved.
+
+Completed frames are persistent float RGBA files in `<Runtime folder>/.cache-ofx/`.
+They survive worker/Resolve restarts if the project is saved with the node. Each
+1080p frame takes about 32 MiB; a 360-frame bake is about 11.1 GiB. Use a fast SSD.
+Each new Process request creates a new cache directory. Old directories can be
+removed when their jobs are stopped and their saved project bakes are no longer
+needed. This cache is excluded from Git. Viewer proxy renders use the preview
+path; the bake driver requests full resolution.
+
+The button honors **Frames Per Block**: 8 processes the whole clip in separate
+8-frame blocks; 0 processes it as one continuous shot for full RVM/Hann continuity.
+Use 0 for final temporal quality if the extra temporary disk storage is available.
+
+### Node setup
+
 1. In Fusion, add **CorridorKey 2 (Community)** from the CorridorKey tools group.
    Connect MediaIn to Source. The Color page also receives the OFX Filter context.
 2. Set Runtime folder if not populated. Choose the input transfer explicitly.
@@ -163,6 +200,7 @@ complete may require manually running the worker from a terminal to see stderr.
 ```powershell
 python -m unittest discover -s ofx/tests -v
 python ofx/tests/check_binary.py ofx/build-zig/CorridorKey2.ofx.bundle
+ctest --test-dir ofx/build-zig --output-on-failure
 .venv-ofx/Scripts/python.exe ofx/tests/smoke_real.py
 ```
 

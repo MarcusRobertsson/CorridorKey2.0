@@ -1,6 +1,7 @@
 // CorridorKey 2 OFX adapter. SDK: OpenFX contributors, BSD-3-Clause.
 #include "ofxsImageEffect.h"
 #include "ofxsMessage.h"
+#include "HostMessages.h"
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <cstring>
 
 namespace fs = std::filesystem;
 namespace {
@@ -46,6 +48,123 @@ class Keyer : public OFX::ImageEffect {
     HANDLE process = nullptr;
     std::mutex lock;
     std::map<fs::path, std::array<unsigned char, 32>> imageHashes;
+    std::string stagedSignature;
+    double stagedStart = 0, stagedEnd = -1;
+
+    std::string bakeSignature(double time) {
+        std::ostringstream s; s.imbue(std::locale::classic()); s << std::setprecision(17);
+        for (const char* p : {"hintMode", "inputColorspace", "outputMode"}) s << p << ':' << choice(p, time) << ';';
+        for (const char* p : {"hintQuality", "despillStrength", "reconstructionMix"}) s << p << ':' << real(p, time) << ';';
+        for (const char* p : {"sourcePremult", "autoDespeckle"}) s << p << ':' << boolean(p, time) << ';';
+        s << integer("despeckleSize", time) << ';' << integer("temporalFrames", time) << ';';
+        auto file = string("settingsFile"); s << json(file) << ';';
+        if (!file.empty()) s << readText(fs::u8path(file));
+        return s.str();
+    }
+    fs::path bakeDirectory() {
+        auto token = string("bakeToken");
+        if (token.empty() || token.find_first_not_of("0123456789-") != std::string::npos) return {};
+        return fs::u8path(string("runtimeRoot")) / ".cache-ofx" / token;
+    }
+    fs::path bakedFrame(const fs::path& dir, double time) {
+        return dir / ("frame_" + std::to_string(std::llround(time * 1000000)) + ".rgba");
+    }
+    bool loadBaked(OFX::Image* output, const fs::path& path, const OfxRectI& window) {
+        if (!fs::exists(path)) return false;
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER length{}; GetFileSizeEx(file, &length);
+        HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        const char* data = mapping ? static_cast<const char*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)) : nullptr;
+        bool valid = false;
+        if (data && length.QuadPart >= sizeof(OfxRectI)) {
+            OfxRectI b{}; std::memcpy(&b, data, sizeof(b));
+            const auto width = b.x2 - b.x1, height = b.y2 - b.y1;
+            auto expected = output->getBounds();
+            valid = width > 0 && height > 0 && width <= 16384 && height <= 16384
+                && b.x1 == expected.x1 && b.y1 == expected.y1 && b.x2 == expected.x2 && b.y2 == expected.y2
+                && length.QuadPart == sizeof(b) + int64_t(width) * height * 16;
+            if (valid) {
+                int left = std::max(b.x1, window.x1), right = std::min(b.x2, window.x2);
+                for (int y = std::max(b.y1, window.y1); y < std::min(b.y2, window.y2) && left < right; ++y) {
+                    auto dstRow = output->getPixelAddress(left, y);
+                    if (!dstRow) { valid = false; break; }
+                    auto srcRow = data + sizeof(b) + (int64_t(b.y2 - 1 - y) * width + left - b.x1) * 16;
+                    std::memcpy(dstRow, srcRow, size_t(right - left) * 16);
+                }
+            }
+        }
+        if (data) UnmapViewOfFile(data);
+        if (mapping) CloseHandle(mapping);
+        CloseHandle(file);
+        return valid;
+    }
+    void storeBaked(const fs::path& path, const OfxRectI& bounds, const fs::path& result) {
+        auto temporary = path; temporary += ".tmp";
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(&bounds), sizeof(bounds));
+        std::ifstream input(result, std::ios::binary); out << input.rdbuf(); out.close();
+        if (!out) throw std::runtime_error("Cannot save playback cache; check disk space");
+        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("Cannot commit playback cache frame");
+    }
+    void setJobStatus(const std::string& text) { fetchStringParam("processStatus")->setValue(text); }
+    void invalidateBake() {
+        auto dir = bakeDirectory();
+        if (dir.empty()) return;
+        std::ofstream(dir / "cancel").close();
+        fetchStringParam("bakeToken")->setValue("");
+        setJobStatus("Settings/input changed — process clip again.");
+    }
+    void beginClipJob() {
+        if (!src->isConnected()) throw std::runtime_error("Connect a source clip first");
+        auto prior = bakeDirectory();
+        if (!prior.empty() && fs::exists(prior / "running")) {
+            DWORD pid = 0; { std::ifstream input(prior / "driver.pid"); input >> pid; }
+            HANDLE driver = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+            bool alive = driver && WaitForSingleObject(driver, 0) == WAIT_TIMEOUT;
+            if (driver) CloseHandle(driver);
+            if (alive) { setJobStatus("Already processing — use Cancel to stop."); return; }
+            fs::remove(prior / "running");
+        }
+        fs::path root = fs::u8path(string("runtimeRoot"));
+        fs::path python = root / ".venv-ofx/Scripts/python.exe";
+        fs::path helper = root / "ofx/backend/clip_job.py";
+        if (!fs::exists(python) || !fs::exists(helper)) throw std::runtime_error("Set Runtime folder and install the OFX runtime first");
+        auto r = src->getFrameRange();
+        if (!std::isfinite(r.min) || !std::isfinite(r.max) || r.max < r.min || r.max - r.min > 1000000)
+            throw std::runtime_error("Source must have a finite clip range");
+        auto token = std::to_string(GetCurrentProcessId()) + '-' + std::to_string(GetTickCount64()) + '-' + std::to_string(++serial);
+        auto directory = root / ".cache-ofx" / token;
+        fs::create_directories(directory);
+        { std::ofstream out(directory / "signature.txt", std::ios::binary); out << bakeSignature(0); }
+        { std::ofstream out(directory / "job.json", std::ios::binary);
+          out.imbue(std::locale::classic()); out << std::setprecision(17) << "{\"token\":" << json(token) << ",\"start\":" << r.min << ",\"end\":" << r.max << '}'; }
+        std::ofstream(directory / "running").close();
+        fetchStringParam("bakeToken")->setValue(token);
+        setJobStatus("Starting entire-clip processing...");
+        std::wstring command = L"\"" + python.wstring() + L"\" \"" + helper.wstring() + L"\" --job \"" + directory.wstring() + L"\"";
+        STARTUPINFOW si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, root.c_str(), &si, &pi)) {
+            fs::remove(directory / "running"); throw std::runtime_error("Could not start Fusion processing helper");
+        }
+        { std::ofstream pid(directory / "driver.pid"); pid << pi.dwProcessId; }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+
+    // Some Fusion hosts omit MessageSuiteV2 or return ErrUnsupported from it.
+    // UI notifications must never change the result of a completed render.
+    void clearStatus() noexcept {
+        corridorkey::clearHostStatus(*this);
+    }
+    void reportError(const std::string& error) noexcept {
+        try { std::ofstream(work / "host-error.txt", std::ios::binary) << error; } catch (...) {}
+        try {
+            auto dir = bakeDirectory();
+            if (!dir.empty()) std::ofstream(dir / "render-error.txt", std::ios::binary) << error;
+        } catch (...) {}
+        corridorkey::reportHostError(*this, error);
+    }
 
     int integer(const char* name, double t) { int v; fetchIntParam(name)->getValueAtTime(t, v); return v; }
     int choice(const char* name, double t) { int v; fetchChoiceParam(name)->getValueAtTime(t, v); return v; }
@@ -180,10 +299,34 @@ public:
         stop();
         std::error_code error; fs::remove_all(work, error);
     }
-    void changedParam(const OFX::InstanceChangedArgs&, const std::string& name) override {
+    void changedParam(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+        // Programmatic status/token updates are deliberately non-evaluating.
+        if (name == "processStatus" || name == "bakeToken") return;
+        if (name == "processClip") {
+            try { beginClipJob(); } catch (const std::exception& e) { setJobStatus(std::string("FAILED: ") + e.what()); }
+            return;
+        }
+        if (name == "cancelClip") {
+            auto dir = bakeDirectory(); if (!dir.empty()) std::ofstream(dir / "cancel").close();
+            setJobStatus("Cancelling after the current frame..."); return;
+        }
+        if (name == "refreshStatus") {
+            auto dir = bakeDirectory();
+            if (!dir.empty() && fs::exists(dir / "failure.txt")) setJobStatus(readText(dir / "failure.txt"));
+            else if (!dir.empty() && fs::exists(dir / "status.txt")) setJobStatus(readText(dir / "status.txt"));
+            return;
+        }
+        if (args.reason == OFX::eChangeUserEdit) invalidateBake();
         if (name == "runtimeRoot") { std::lock_guard<std::mutex> guard(lock); stop(); }
     }
+    void changedClip(const OFX::InstanceChangedArgs& args, const std::string& name) override {
+        if (args.reason == OFX::eChangeUserEdit && (name == "Source" || name == "AlphaHint")) invalidateBake();
+    }
     void getFramesNeeded(const OFX::FramesNeededArguments& args, OFX::FramesNeededSetter& frames) override {
+        auto dir = bakeDirectory();
+        if (!dir.empty() && readText(dir / "signature.txt") == bakeSignature(args.time) && fs::exists(bakedFrame(dir, args.time))) {
+            OfxRangeD current{args.time, args.time}; frames.setFramesNeeded(*src, current); return;
+        }
         auto r = range(args.time); frames.setFramesNeeded(*src, r);
         if (hint->isConnected()) {
             if (choice("hintMode", args.time) == 1) {
@@ -204,10 +347,16 @@ public:
         std::lock_guard<std::mutex> guard(lock);
         try {
             std::unique_ptr<OFX::Image> output(dst->fetchImage(args.time));
-            std::unique_ptr<OFX::Image> current(src->fetchImage(args.time));
-            if (!current || !output) throw std::runtime_error("Resolve could not supply source/output image");
+            if (!output) throw std::runtime_error("Resolve could not supply output image");
             if (output->getPixelDepth() != OFX::eBitDepthFloat || output->getPixelComponentCount() != 4)
                 throw std::runtime_error("CorridorKey 2 requires RGBA float output");
+            auto cache = bakeDirectory();
+            auto signature = cache.empty() ? std::string() : bakeSignature(args.time);
+            bool baking = !cache.empty() && readText(cache / "signature.txt") == signature
+                && args.renderScale.x == 1.0 && args.renderScale.y == 1.0;
+            if (baking && loadBaked(output.get(), bakedFrame(cache, args.time), args.renderWindow)) { clearStatus(); return; }
+            std::unique_ptr<OFX::Image> current(src->fetchImage(args.time));
+            if (!current) throw std::runtime_error("Resolve could not supply source image");
             auto bounds = current->getBounds();
             const int width = bounds.x2 - bounds.x1, height = bounds.y2 - bounds.y1;
             if (width < 1 || height < 1 || width > 16384 || height > 16384)
@@ -217,7 +366,10 @@ public:
             int mode = choice("hintMode", args.time);
             if ((mode == 1 || mode == 2) && !hint->isConnected()) throw std::runtime_error("Connect a matte to AlphaHint or choose No Hint");
             start();
-            for (int i = 0; i < count; ++i) {
+            bool frozen = baking && fs::exists(cache / "running") && !fs::exists(cache / "cancel");
+            auto stageKey = string("bakeToken") + signature;
+            bool reuseInputs = frozen && stagedSignature == stageKey && stagedStart == r.min && stagedEnd == r.max;
+            for (int i = 0; !reuseInputs && i < count; ++i) {
                 if (abort()) OFX::throwSuiteStatusException(kOfxStatFailed);
                 std::unique_ptr<OFX::Image> image(src->fetchImage(r.min + i));
                 if (!image) throw std::runtime_error("Resolve did not supply the requested temporal source frame");
@@ -231,6 +383,7 @@ public:
                     writeImage(mask.get(), work / frameName("hint", i), bounds, true);
                 }
             }
+            if (frozen) { stagedSignature = stageKey; stagedStart = r.min; stagedEnd = r.max; }
             std::ostringstream request; request.imbue(std::locale::classic());
             request << std::setprecision(17) << "{\"protocol\":2,\"width\":" << width << ",\"height\":" << height
                 << ",\"count\":" << count << ",\"start\":" << r.min << ",\"index\":" << int(std::llround(args.time - r.min))
@@ -241,6 +394,7 @@ public:
                 << ",\"despill\":" << real("despillStrength", args.time)
                 << ",\"despeckle\":" << (boolean("autoDespeckle", args.time) ? integer("despeckleSize", args.time) : 0)
                 << ",\"refiner\":" << real("reconstructionMix", args.time)
+                << ",\"staged_token\":" << json(frozen ? string("bakeToken") : "")
                 << ",\"settings\":" << json(string("settingsFile")) << "}";
             fs::remove(work / "done.json"); fs::remove(work / "error.txt");
             { std::ofstream out(work / "request.tmp", std::ios::binary); out << request.str(); out.close();
@@ -250,6 +404,7 @@ public:
             if (fs::exists(work / "error.txt")) throw std::runtime_error(readText(work / "error.txt"));
             fs::path result = work / "output.bin";
             if (fs::file_size(result) != size_t(width) * height * 16) throw std::runtime_error("Backend output has incorrect size");
+            if (baking) storeBaked(bakedFrame(cache, args.time), bounds, result);
             std::ifstream input(result, std::ios::binary);
             std::vector<float> row(size_t(width) * 4);
             for (int y = bounds.y2 - 1; y >= bounds.y1; --y) {
@@ -261,9 +416,9 @@ public:
                     if (p) std::copy_n(row.data() + size_t(x - bounds.x1) * 4, 4, p);
                 }
             }
-            clearPersistentMessage();
+            clearStatus();
         } catch (const std::exception& error) {
-            setPersistentMessage(OFX::Message::eMessageError, "CorridorKey2", error.what());
+            reportError(error.what());
             OFX::throwSuiteStatusException(kOfxStatFailed);
         }
     }
@@ -290,6 +445,18 @@ public:
         mask->setTemporalClipAccess(true); mask->setSupportsTiles(false);
         auto output = desc.defineClip("Output"); output->addSupportedComponent(OFX::ePixelComponentRGBA); output->setSupportsTiles(false);
         auto page = desc.definePageParam("Controls");
+        auto run = desc.definePushButtonParam("processClip"); run->setLabel("Process Entire Clip");
+        run->setHint("Render all frames to persistent playback cache. Shows progress below. Keep this Fusion comp open."); page->addChild(*run);
+        auto cancel = desc.definePushButtonParam("cancelClip"); cancel->setLabel("Cancel Processing"); page->addChild(*cancel);
+        auto status = desc.defineStringParam("processStatus"); status->setLabel("Processing Status");
+        status->setDefault("Not processed — click Process Entire Clip."); status->setAnimates(false);
+        status->setEvaluateOnChange(false); status->setCanUndo(false); status->setEnabled(false); page->addChild(*status);
+        auto refresh = desc.definePushButtonParam("refreshStatus"); refresh->setLabel("Refresh Status"); page->addChild(*refresh);
+        auto token = desc.defineStringParam("bakeToken"); token->setDefault(""); token->setAnimates(false);
+        // New jobs must invalidate Fusion's pre-existing RAM/output cache so
+        // GetValue actually evaluates each frame and commits our disk cache.
+        token->setEvaluateOnChange(true); token->setCacheInvalidation(OFX::eCacheInvalidateValueAll);
+        token->setCanUndo(false); token->setIsSecret(true);
         auto path = desc.defineStringParam("runtimeRoot"); path->setLabel("Runtime folder");
         path->setStringType(OFX::eStringTypeDirectoryPath); path->setAnimates(false);
         const wchar_t* root = _wgetenv(L"CORRIDORKEY2_ROOT");

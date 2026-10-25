@@ -35,6 +35,7 @@ class Engine:
         self.root, self.work, self.mock = root, work, mock
         self.model = None
         self.key = None
+        self.staged_signature = None
         self.output_dir = work / "predictions"
 
     def settings(self, path):
@@ -59,7 +60,13 @@ class Engine:
         hint_files = ([self.work / f"hint_{i:06d}.bin" for i in range(count)]
                       if req["mode"] == 2 else
                       [self.work / "hint_000000.bin"] if req["mode"] == 1 else [])
-        key = cache_key(req, source_files + hint_files, settings)
+        # A clip bake owns an immutable input snapshot. Hash it once per block,
+        # rather than re-reading a whole shot for every output frame. Ordinary
+        # preview renders always hash the actual source and hint bytes.
+        staged = (json.dumps([req.get("staged_token"), settings,
+            {k: req[k] for k in ("width", "height", "start", "count", "mode", "colorspace", "premult", "quality")}], sort_keys=True)
+            if req.get("staged_token") else None)
+        key = self.key if staged and staged == self.staged_signature and self.key else cache_key(req, source_files + hint_files, settings)
         if key != self.key:
             self.key = None
             if self.mock:
@@ -67,6 +74,7 @@ class Engine:
             else:
                 self.predict(req, source_files, hint_files, settings)
             self.key = key
+        self.staged_signature = staged
         i = req["index"]
         if self.mock:
             fg = np.load(self.output_dir / f"fg_{i:06d}.npy")
